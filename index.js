@@ -39,6 +39,10 @@ app.use(cors(corsOptions));
 // NOTE: In some Express/router versions, app.options("*") throws in path-to-regexp.
 // Using a RegExp safely matches all routes for preflight.
 app.options(/.*/, cors(corsOptions));
+
+// Use raw body parsing strictly for razorpay webhooks so we can verify the signature
+app.use("/webhooks/razorpay", express.raw({ type: "application/json" }));
+
 app.use(express.json());
 
 // Database connection
@@ -151,6 +155,25 @@ app.post("/payments/create-order", authMiddleware, async (req, res) => {
 
         const order = await razorpay.orders.create(options);
 
+        // Pre-create the order as "created" so webhooks have a DB record to attach to.
+        await Order.create({
+            user: req.user._id,
+            size,
+            count: qty,
+            amount: amountPaise,
+            currency: options.currency,
+            razorpayOrderId: order.id,
+            status: "created",
+            customerSnapshot: {
+                name: req.user.name,
+                email: req.user.email,
+                phoneNumber: req.user.phoneNumber,
+                batch: req.user.batch,
+                department: req.user.department,
+                gender: req.user.gender,
+            },
+        });
+
         res.json({
             orderId: order.id,
             amount: order.amount,
@@ -241,28 +264,22 @@ app.post("/payments/verify", authMiddleware, async (req, res) => {
             return res.status(400).json({ error: "Invalid payment signature" });
         }
 
-        const qty = parseInt(count, 10) || 1;
+        let order = await Order.findOne({ razorpayOrderId: razorpay_order_id });
 
-        const paidOrder = await Order.create({
-            user: req.user._id,
-            size,
-            count: qty,
-            amount,
-            currency: "INR",
-            razorpayOrderId: razorpay_order_id,
-            razorpayPaymentId: razorpay_payment_id,
-            razorpaySignature: razorpay_signature,
-            status: "paid",
-            customerSnapshot: {
-                name: req.user.name,
-                email: req.user.email,
-                phoneNumber: req.user.phoneNumber,
-                batch: req.user.batch,
-                department: req.user.department,
-                gender: req.user.gender,
-            },
-            orderDate: new Date(),
-        });
+        if (!order) {
+            return res.status(404).json({ error: "Order not found" });
+        }
+
+        if (order.status === "paid") {
+            // Webhook might have already processed this
+            return res.json({ success: true, order });
+        }
+
+        order.status = "paid";
+        order.razorpayPaymentId = razorpay_payment_id;
+        order.razorpaySignature = razorpay_signature;
+
+        const paidOrder = await order.save();
 
         // fire-and-forget append to Google Sheets
         appendOrderToSheet(paidOrder).catch(() => { });
@@ -271,6 +288,66 @@ app.post("/payments/verify", authMiddleware, async (req, res) => {
     } catch (error) {
         console.error("Error verifying payment:", error);
         res.status(500).json({ error: "Payment verification failed" });
+    }
+});
+
+// Razorpay Webhook Handler
+app.post("/webhooks/razorpay", async (req, res) => {
+    try {
+        const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+        const signature = req.headers["x-razorpay-signature"];
+
+        if (!webhookSecret || !signature) {
+            return res.status(400).send("Webhook secret or signature missing");
+        }
+
+        const expectedSignature = crypto
+            .createHmac("sha256", webhookSecret)
+            .update(req.body)
+            .digest("hex");
+
+        if (expectedSignature !== signature) {
+            return res.status(400).send("Invalid signature");
+        }
+
+        // req.body is a buffer here because of express.raw
+        const payload = JSON.parse(req.body.toString());
+
+        const event = payload.event;
+        const paymentEntity = payload.payload?.payment?.entity;
+        const orderId = paymentEntity?.order_id;
+        const paymentId = paymentEntity?.id;
+
+        if (!orderId) {
+            return res.status(400).send("Missing orderId in payload");
+        }
+
+        let order = await Order.findOne({ razorpayOrderId: orderId });
+
+        if (!order) {
+            console.error(`Webhook: Order ${orderId} not found in DB`);
+            return res.status(404).send("Order not found");
+        }
+
+        if (event === "payment.captured") {
+            if (order.status !== "paid") {
+                order.status = "paid";
+                order.razorpayPaymentId = paymentId;
+                const paidOrder = await order.save();
+                appendOrderToSheet(paidOrder).catch(() => { });
+            }
+        } else if (event === "payment.failed") {
+            if (order.status !== "paid") {
+                order.status = "failed";
+                order.razorpayPaymentId = paymentId;
+                await order.save();
+            }
+        }
+
+        res.status(200).send("OK");
+    } catch (error) {
+        console.error("Webhook processing error:", error);
+        res.status(500).send("Internal Error");
     }
 });
 
