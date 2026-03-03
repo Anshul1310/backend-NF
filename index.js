@@ -12,7 +12,32 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // Middleware
-app.use(cors({ origin: "http://localhost:3000" }));
+const allowedOrigins = new Set([
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://nf-portfolio23.vercel.app",
+]);
+
+const corsOptions = {
+    origin: (origin, callback) => {
+        // allow non-browser clients (curl/postman) with no origin
+        if (!origin) return callback(null, true);
+
+        if (allowedOrigins.has(origin)) {
+            return callback(null, true);
+        }
+
+        return callback(new Error(`CORS blocked for origin: ${origin}`));
+    },
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+// NOTE: In some Express/router versions, app.options("*") throws in path-to-regexp.
+// Using a RegExp safely matches all routes for preflight.
+app.options(/.*/, cors(corsOptions));
 app.use(express.json());
 
 // Database connection
