@@ -77,6 +77,7 @@ const orderSchema = new mongoose.Schema({
     razorpayPaymentId: { type: String },
     razorpaySignature: { type: String },
     status: { type: String, enum: ["created", "paid", "failed"], default: "created" },
+    branch2: { type: String }, // Branch for T-Shirt 2
     customerSnapshot: {
         name: String,
         email: String,
@@ -129,7 +130,7 @@ app.get("/hello", (req, res) => {
 // Create Razorpay order
 app.post("/payments/create-order", authMiddleware, async (req, res) => {
     try {
-        const { size, count } = req.body;
+        const { size, count, branch2 } = req.body;
         const qty = parseInt(count, 10) || 1;
 
         if (!size) {
@@ -163,6 +164,7 @@ app.post("/payments/create-order", authMiddleware, async (req, res) => {
             user: req.user._id,
             size,
             count: qty,
+            branch2: branch2 || "",
             amount: amountPaise,
             currency: options.currency,
             razorpayOrderId: order.id,
@@ -226,6 +228,7 @@ async function appendOrderToSheet(order) {
             order.razorpayOrderId,
             order.razorpayPaymentId || "",
             order.status,
+            order.branch2 || "",
         ]];
 
         await sheets.spreadsheets.values.append({
@@ -249,6 +252,7 @@ app.post("/payments/verify", authMiddleware, async (req, res) => {
             size,
             count,
             amount,
+            branch2,
         } = req.body;
 
         if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !size || !count || !amount) {
@@ -398,6 +402,7 @@ app.post("/auth/dauth/callback", async (req, res) => {
         });
 
         const userData = userResponse.data;
+        console.log("DAuth User Data:", userData);
 
         // NITT DAuth returns properties like gender, name, email, phoneNumber, batch, id, etc.
         const { email, name, gender, id, phoneNumber, batch, department } = userData;
