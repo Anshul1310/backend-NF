@@ -17,6 +17,7 @@ const allowedOrigins = new Set([
     "http://127.0.0.1:3000",
     "http://20.2.141.38",
     "https://nf-portfolio23.vercel.app",
+    "https://www.nittfest.in"
 ]);
 
 const corsOptions = {
