@@ -69,7 +69,8 @@ const User = mongoose.model("User", userSchema);
 // Mongoose Order Schema
 const orderSchema = new mongoose.Schema({
     user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
-    size: { type: String, required: true },
+    size1: { type: String, required: true },
+    size2: { type: String },
     count: { type: Number, required: true },
     amount: { type: Number, required: true }, // in paise
     currency: { type: String, default: "INR" },
@@ -77,6 +78,7 @@ const orderSchema = new mongoose.Schema({
     razorpayPaymentId: { type: String },
     razorpaySignature: { type: String },
     status: { type: String, enum: ["created", "paid", "failed"], default: "created" },
+    branch1: { type: String }, // Branch for T-Shirt 1
     branch2: { type: String }, // Branch for T-Shirt 2
     customerSnapshot: {
         name: String,
@@ -130,11 +132,11 @@ app.get("/hello", (req, res) => {
 // Create Razorpay order
 app.post("/payments/create-order", authMiddleware, async (req, res) => {
     try {
-        const { size, count, branch2 } = req.body;
+        const { size1, size2, count, branch1, branch2 } = req.body;
         const qty = parseInt(count, 10) || 1;
 
-        if (!size) {
-            return res.status(400).json({ error: "Size is required" });
+        if (!size1) {
+            return res.status(400).json({ error: "Size 1 is required" });
         }
 
         // Simple pricing logic: 1 for 260, 2 for 499
@@ -151,7 +153,8 @@ app.post("/payments/create-order", authMiddleware, async (req, res) => {
             currency: "INR",
             receipt: `nf-merch-${Date.now()}`,
             notes: {
-                size,
+                size1,
+                size2: size2 || "",
                 count: qty,
                 userId: req.user._id.toString(),
             },
@@ -162,8 +165,10 @@ app.post("/payments/create-order", authMiddleware, async (req, res) => {
         // Pre-create the order as "created" so webhooks have a DB record to attach to.
         await Order.create({
             user: req.user._id,
-            size,
+            size1,
+            size2: size2 || "",
             count: qty,
+            branch1: branch1 || "",
             branch2: branch2 || "",
             amount: amountPaise,
             currency: options.currency,
@@ -221,13 +226,15 @@ async function appendOrderToSheet(order) {
             order.customerSnapshot?.name || "",
             order.customerSnapshot?.email || "",
             order.customerSnapshot?.phoneNumber || "",
-            order.size,
+            order.size1,
+            order.size2 || "",
             order.count,
             (order.amount / 100).toString(),
             order.currency,
             order.razorpayOrderId,
             order.razorpayPaymentId || "",
             order.status,
+            order.branch1 || "",
             order.branch2 || "",
         ]];
 
@@ -249,13 +256,15 @@ app.post("/payments/verify", authMiddleware, async (req, res) => {
             razorpay_order_id,
             razorpay_payment_id,
             razorpay_signature,
-            size,
+            size1,
+            size2,
             count,
             amount,
+            branch1,
             branch2,
         } = req.body;
 
-        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !size || !count || !amount) {
+        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !size1 || !count || !amount) {
             return res.status(400).json({ error: "Missing payment details" });
         }
 
@@ -361,7 +370,7 @@ app.post("/webhooks/razorpay", async (req, res) => {
 // Get orders for logged-in user
 app.get("/orders/my", authMiddleware, async (req, res) => {
     try {
-        const orders = await Order.find({ user: req.user._id })
+        const orders = await Order.find({ user: req.user._id, status: "paid" })
             .sort({ createdAt: -1 });
         res.json({ orders });
     } catch (error) {
