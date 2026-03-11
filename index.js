@@ -117,6 +117,49 @@ const orderTeamSchema = new mongoose.Schema({
 
 const OrderTeam = mongoose.model("OrderTeam", orderTeamSchema);
 
+// Mongoose Event Registration Schema
+const eventRegistrationSchema = new mongoose.Schema({
+    user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    eventId: { type: Number, required: true },
+    amount: { type: Number, required: true }, // in paise
+    currency: { type: String, default: "INR" },
+    razorpayOrderId: { type: String },
+    razorpayPaymentId: { type: String },
+    razorpaySignature: { type: String },
+    status: { type: String, enum: ["created", "paid", "failed"], default: "created" },
+    orderDate: { type: Date, default: Date.now },
+}, { timestamps: true });
+
+const EventRegistration = mongoose.model("EventRegistration", eventRegistrationSchema);
+
+// Mongoose Informal Order Schema
+const informalOrderSchema = new mongoose.Schema({
+    user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    eventId: { type: Number, required: true },
+    eventName: { type: String, required: true },
+    teamSize: { type: Number, required: true },
+    rollNumber2: { type: String },
+    name2: { type: String },
+    contactNumber2: { type: String },
+    amount: { type: Number, required: true }, // in paise
+    currency: { type: String, default: "INR" },
+    razorpayOrderId: { type: String, required: true },
+    razorpayPaymentId: { type: String },
+    razorpaySignature: { type: String },
+    status: { type: String, enum: ["created", "paid", "failed"], default: "created" },
+    customerSnapshot: {
+        name: String,
+        email: String,
+        phoneNumber: String,
+        batch: String,
+        department: String,
+        gender: String,
+    },
+    orderDate: { type: Date, default: Date.now },
+}, { timestamps: true, collection: "informalOrders" });
+
+const InformalOrder = mongoose.model("InformalOrder", informalOrderSchema);
+
 // Razorpay instance
 const razorpay = new Razorpay({
     key_id: process.env.RAZORPAY_KEY_ID,
@@ -525,14 +568,26 @@ app.post("/webhooks/razorpay", async (req, res) => {
 
         let order = await Order.findOne({ razorpayOrderId: orderId });
         let isTeamOrder = false;
+        let isEventOrder = false;
+        let isInformalOrder = false;
 
         if (!order) {
             order = await OrderTeam.findOne({ razorpayOrderId: orderId });
             if (order) {
                 isTeamOrder = true;
             } else {
-                console.error(`Webhook: Order ${orderId} not found in DB`);
-                return res.status(404).send("Order not found");
+                order = await EventRegistration.findOne({ razorpayOrderId: orderId });
+                if (order) {
+                    isEventOrder = true;
+                } else {
+                    order = await InformalOrder.findOne({ razorpayOrderId: orderId });
+                    if (order) {
+                        isInformalOrder = true;
+                    } else {
+                        console.error(`Webhook: Order ${orderId} not found in DB`);
+                        return res.status(404).send("Order not found");
+                    }
+                }
             }
         }
 
@@ -544,8 +599,16 @@ app.post("/webhooks/razorpay", async (req, res) => {
 
                 if (isTeamOrder) {
                     appendTeamOrderToSheet(paidOrder).catch(() => { });
-                } else {
+                } else if (!isEventOrder && !isInformalOrder) {
                     appendOrderToSheet(paidOrder).catch(() => { });
+                }
+
+                // If informal order is paid, also mark corresponding EventRegistration as paid
+                if (isInformalOrder) {
+                    await EventRegistration.findOneAndUpdate(
+                        { razorpayOrderId: orderId },
+                        { status: "paid", razorpayPaymentId: paymentId }
+                    );
                 }
             }
         } else if (event === "payment.failed") {
@@ -553,6 +616,13 @@ app.post("/webhooks/razorpay", async (req, res) => {
                 order.status = "failed";
                 order.razorpayPaymentId = paymentId;
                 await order.save();
+
+                if (isInformalOrder) {
+                    await EventRegistration.findOneAndUpdate(
+                        { razorpayOrderId: orderId },
+                        { status: "failed", razorpayPaymentId: paymentId }
+                    );
+                }
             }
         }
 
@@ -584,6 +654,220 @@ app.get("/orders/team/my", authMiddleware, async (req, res) => {
     } catch (error) {
         console.error("Error fetching team orders:", error);
         res.status(500).json({ error: "Failed to fetch team orders" });
+    }
+});
+
+// Create Razorpay order for Events/Workshops
+app.post("/events/create-order", authMiddleware, async (req, res) => {
+    try {
+        const { eventId, amount } = req.body; // amount in rupees
+
+        if (!eventId) {
+            return res.status(400).json({ error: "Event ID is required" });
+        }
+
+        const amountPaise = (amount || 0) * 100;
+
+        if (amountPaise > 0) {
+            const options = {
+                amount: amountPaise,
+                currency: "INR",
+                receipt: `evt_${eventId}_${Date.now()}`
+            };
+
+            const order = await razorpay.orders.create(options);
+
+            await EventRegistration.create({
+                user: req.user._id,
+                eventId,
+                amount: amountPaise,
+                currency: options.currency,
+                razorpayOrderId: order.id,
+                status: "created"
+            });
+
+            res.json({
+                orderId: order.id,
+                amount: order.amount,
+                currency: order.currency,
+                razorpayKeyId: process.env.RAZORPAY_KEY_ID
+            });
+        } else {
+            // Free event
+            await EventRegistration.create({
+                user: req.user._id,
+                eventId,
+                amount: 0,
+                status: "paid"
+            });
+            res.json({ success: true, isFree: true });
+        }
+    } catch (error) {
+        console.error("Error creating event order:", error);
+        res.status(500).json({ error: "Failed to create event order" });
+    }
+});
+
+// Verify Razorpay signature for Events/Workshops
+app.post("/events/verify", authMiddleware, async (req, res) => {
+    try {
+        const {
+            razorpay_order_id,
+            razorpay_payment_id,
+            razorpay_signature,
+        } = req.body;
+
+        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+            return res.status(400).json({ error: "Missing payment details" });
+        }
+
+        const body = razorpay_order_id + "|" + razorpay_payment_id;
+        const expectedSignature = crypto
+            .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+            .update(body.toString())
+            .digest("hex");
+
+        if (expectedSignature === razorpay_signature) {
+            await EventRegistration.findOneAndUpdate(
+                { razorpayOrderId: razorpay_order_id },
+                {
+                    razorpayPaymentId: razorpay_payment_id,
+                    razorpaySignature: razorpay_signature,
+                    status: "paid"
+                }
+            );
+            res.status(200).json({ message: "Payment verified successfully" });
+        } else {
+            await EventRegistration.findOneAndUpdate({ razorpayOrderId: razorpay_order_id }, { status: "failed" });
+            res.status(400).json({ error: "Invalid payment signature" });
+        }
+    } catch (error) {
+        console.error("Error verifying event payment:", error);
+        res.status(500).json({ error: "Payment verification failed" });
+    }
+});
+
+// Informals Create Order
+app.post("/informals/create-order", authMiddleware, async (req, res) => {
+    try {
+        const { eventId, eventName, amount, teamSize, rollNumber2, name2, contactNumber2 } = req.body;
+
+        if (!eventId || !eventName || !amount || !teamSize) {
+            return res.status(400).json({ error: "Missing required fields" });
+        }
+
+        const amountPaise = amount * 100;
+
+        const options = {
+            amount: amountPaise,
+            currency: "INR",
+            receipt: `inf_${eventId}_${Date.now()}`
+        };
+
+        const order = await razorpay.orders.create(options);
+
+        // Save registration details
+        await InformalOrder.create({
+            user: req.user._id,
+            eventId,
+            eventName,
+            teamSize,
+            rollNumber2,
+            name2,
+            contactNumber2,
+            amount: amountPaise,
+            currency: options.currency,
+            razorpayOrderId: order.id,
+            status: "created",
+            customerSnapshot: {
+                name: req.user.name,
+                email: req.user.email,
+                phoneNumber: req.user.phoneNumber,
+                batch: req.user.batch,
+                department: req.user.department,
+                gender: req.user.gender,
+            }
+        });
+
+        // Also save to EventRegistration so it shows up in "Registered" state in frontend
+        await EventRegistration.create({
+            user: req.user._id,
+            eventId,
+            amount: amountPaise,
+            currency: options.currency,
+            razorpayOrderId: order.id,
+            status: "created"
+        });
+
+        res.json({
+            orderId: order.id,
+            amount: order.amount,
+            currency: order.currency,
+            razorpayKeyId: process.env.RAZORPAY_KEY_ID
+        });
+    } catch (error) {
+        console.error("Error creating informal order:", error);
+        res.status(500).json({ error: "Failed to create informal order" });
+    }
+});
+
+// Informals Verify Payment
+app.post("/informals/verify", authMiddleware, async (req, res) => {
+    try {
+        const {
+            razorpay_order_id,
+            razorpay_payment_id,
+            razorpay_signature,
+        } = req.body;
+
+        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+            return res.status(400).json({ error: "Missing payment details" });
+        }
+
+        const body = razorpay_order_id + "|" + razorpay_payment_id;
+        const expectedSignature = crypto
+            .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+            .update(body.toString())
+            .digest("hex");
+
+        if (expectedSignature === razorpay_signature) {
+            await InformalOrder.findOneAndUpdate(
+                { razorpayOrderId: razorpay_order_id },
+                {
+                    razorpayPaymentId: razorpay_payment_id,
+                    razorpaySignature: razorpay_signature,
+                    status: "paid"
+                }
+            );
+
+            await EventRegistration.findOneAndUpdate(
+                { razorpayOrderId: razorpay_order_id },
+                {
+                    razorpayPaymentId: razorpay_payment_id,
+                    razorpaySignature: razorpay_signature,
+                    status: "paid"
+                }
+            );
+            res.status(200).json({ message: "Payment verified successfully" });
+        } else {
+            await InformalOrder.findOneAndUpdate({ razorpayOrderId: razorpay_order_id }, { status: "failed" });
+            await EventRegistration.findOneAndUpdate({ razorpayOrderId: razorpay_order_id }, { status: "failed" });
+            res.status(400).json({ error: "Invalid payment signature" });
+        }
+    } catch (error) {
+        console.error("Error verifying informal payment:", error);
+        res.status(500).json({ error: "Payment verification failed" });
+    }
+});
+
+// Get user's registered events
+app.get("/events/my", authMiddleware, async (req, res) => {
+    try {
+        const registrations = await EventRegistration.find({ user: req.user._id, status: "paid" });
+        res.json({ registeredEventIds: registrations.map(r => r.eventId) });
+    } catch (error) {
+        console.error("Error fetching registered events:", error);
+        res.status(500).json({ error: "Failed to fetch event registrations" });
     }
 });
 
