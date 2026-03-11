@@ -372,6 +372,55 @@ async function appendTeamOrderToSheet(order) {
     }
 }
 
+// Helper function to append informal order data to Google Sheets (Sheet 3)
+async function appendInformalOrderToSheet(order) {
+    try {
+        const sheetId = process.env.GOOGLE_SHEETS_ID;
+        const keyFilePath = process.env.GOOGLE_APPLICATION_CREDENTIALS || "google-credentials.json";
+
+        if (!sheetId) {
+            console.warn("GOOGLE_SHEETS_ID env var not set, skipping informal sheet append.");
+            return;
+        }
+
+        const auth = new google.auth.GoogleAuth({
+            keyFile: keyFilePath,
+            scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+        });
+
+        // Initialize Google Sheets API
+        const sheets = google.sheets({ version: "v4", auth });
+
+        let values = [];
+
+        const date = order.orderDate || order.createdAt || new Date();
+        const orderDateStr = formatDateToIST(date);
+
+        values.push([
+            order.eventName || "",
+            order.teamSize || 1,
+            order.customerSnapshot?.email || "",
+            order.teamSize > 1 ? (order.rollNumber2 || "null") : "null", // Roll number instead of email
+            order.customerSnapshot?.phoneNumber || "",
+            order.teamSize > 1 ? (order.contactNumber2 || "null") : "null",
+            order.customerSnapshot?.name || "",
+            order.teamSize > 1 ? (order.name2 || "null") : "null",
+            orderDateStr
+        ]);
+
+        await sheets.spreadsheets.values.append({
+            spreadsheetId: sheetId,
+            range: "Sheet3!A2:I",
+            valueInputOption: "USER_ENTERED",
+            requestBody: { values },
+        });
+
+        console.log("Informal Order appended to Google Sheet 3 successfully.");
+    } catch (error) {
+        console.error("Error appending informal order to Google Sheet 3:", error);
+    }
+}
+
 // Verify payment and create order (only paid orders stored)
 app.post("/payments/verify", authMiddleware, async (req, res) => {
     try {
@@ -601,6 +650,8 @@ app.post("/webhooks/razorpay", async (req, res) => {
                     appendTeamOrderToSheet(paidOrder).catch(() => { });
                 } else if (!isEventOrder && !isInformalOrder) {
                     appendOrderToSheet(paidOrder).catch(() => { });
+                } else if (isInformalOrder) {
+                    appendInformalOrderToSheet(paidOrder).catch(() => { });
                 }
 
                 // If informal order is paid, also mark corresponding EventRegistration as paid
@@ -831,13 +882,14 @@ app.post("/informals/verify", authMiddleware, async (req, res) => {
             .digest("hex");
 
         if (expectedSignature === razorpay_signature) {
-            await InformalOrder.findOneAndUpdate(
+            const updatedInformalOrder = await InformalOrder.findOneAndUpdate(
                 { razorpayOrderId: razorpay_order_id },
                 {
                     razorpayPaymentId: razorpay_payment_id,
                     razorpaySignature: razorpay_signature,
                     status: "paid"
-                }
+                },
+                { new: true }
             );
 
             await EventRegistration.findOneAndUpdate(
@@ -848,6 +900,11 @@ app.post("/informals/verify", authMiddleware, async (req, res) => {
                     status: "paid"
                 }
             );
+
+            if (updatedInformalOrder) {
+                appendInformalOrderToSheet(updatedInformalOrder).catch(() => {});
+            }
+
             res.status(200).json({ message: "Payment verified successfully" });
         } else {
             await InformalOrder.findOneAndUpdate({ razorpayOrderId: razorpay_order_id }, { status: "failed" });
